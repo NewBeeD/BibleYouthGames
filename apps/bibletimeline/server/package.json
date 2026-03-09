@@ -1,0 +1,15 @@
+{
+  "name": "bible-timeline-pvp-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "smoke:pvp": "node scripts/pvp-smoke-test.mjs"
+  },
+  "dependencies": {
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.1"
+  }
+}

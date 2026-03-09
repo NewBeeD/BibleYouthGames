@@ -1,0 +1,30 @@
+node_modules/
+
+# Dependency caches
+.npm/
+.pnpm-store/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Build outputs
+dist/
+build/
+.next/
+out/
+
+# Coverage
+coverage/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/settings.json

@@ -1,0 +1,31 @@
+*{
+  padding: 0;
+  margin: 0;
+  box-sizing: border-box;
+  
+}
+
+li{
+  list-style-type: none;
+}
+
+.shake{
+  animation-name: horizontal-shaking;
+  animation-duration: 500ms;
+
+}
+
+
+@keyframes horizontal-shaking {
+  0% { transform: translateX(0) }
+  25% { transform: translateX(10px) }
+  50% { transform: translateX(-10px) }
+  75% { transform: translateX(10px) }
+  100% { transform: translateX(0) }
+ }
+
+ .blue{
+
+  display: none;
+ }
+
