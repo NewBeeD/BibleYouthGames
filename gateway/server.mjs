@@ -135,33 +135,181 @@ proxy.on('error', (error, req, res) => {
 });
 
 const launchPageHtml = `<!doctype html>
-<html>
+<html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Church Games</title>
+    <meta
+      name="description"
+      content="Launch Bible Timeline or Name Place Animal Thing from one simple church games homepage."
+    />
     <style>
-      body { margin: 0; font-family: Arial, sans-serif; background: radial-gradient(circle at 20% 20%, #1d4ed8, #0f172a 65%); color: #fff; min-height: 100vh; display: grid; place-items: center; }
-      .card { width: min(92vw, 720px); background: rgba(2,6,23,.85); border: 1px solid rgba(255,255,255,.2); border-radius: 18px; padding: 28px; }
-      h1 { margin: 0 0 10px; font-size: 2rem; }
-      p { margin: 0 0 22px; color: #dbeafe; }
-      .row { display: grid; grid-template-columns: 1fr; gap: 12px; }
-      a { text-decoration: none; display: block; text-align: center; padding: 14px 16px; border-radius: 12px; color: #fff; font-weight: 700; }
-      a.bible { background: linear-gradient(90deg,#1976d2,#42a5f5); }
-      a.npat { background: linear-gradient(90deg,#7c4dff,#1976d2); }
-      .small { margin-top: 14px; color: #bfdbfe; font-size: .9rem; }
+      :root {
+        color-scheme: dark;
+        --bg: #0a1220;
+        --panel: rgba(255, 255, 255, 0.04);
+        --line: rgba(255, 255, 255, 0.12);
+        --text: #f8fafc;
+        --muted: rgba(226, 232, 240, 0.78);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        background:
+          radial-gradient(circle at top, rgba(125, 211, 252, 0.12), transparent 30%),
+          linear-gradient(180deg, #111b2d 0%, var(--bg) 55%, #050913 100%);
+        color: var(--text);
+        font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+      }
+
+      main {
+        width: min(760px, 100%);
+      }
+
+      .frame {
+        border: 1px solid var(--line);
+        border-radius: 28px;
+        background: var(--panel);
+        backdrop-filter: blur(14px);
+        padding: 36px;
+      }
+
+      .eyebrow {
+        margin: 0;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.16em;
+        font-size: 0.72rem;
+        font-weight: 700;
+      }
+
+      h1 {
+        margin: 12px 0 0;
+        font-size: clamp(2.6rem, 9vw, 4.6rem);
+        line-height: 0.95;
+        letter-spacing: -0.05em;
+      }
+
+      .intro {
+        margin: 18px 0 0;
+        max-width: 38rem;
+        color: var(--muted);
+        font-size: 1rem;
+        line-height: 1.7;
+      }
+
+      .games {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+        margin-top: 32px;
+      }
+
+      .game {
+        display: block;
+        padding: 20px;
+        border: 1px solid var(--line);
+        border-radius: 22px;
+        background: rgba(255, 255, 255, 0.03);
+        color: inherit;
+        text-decoration: none;
+        transition: border-color 140ms ease, background 140ms ease, transform 140ms ease;
+      }
+
+      .game:hover {
+        transform: translateY(-1px);
+        background: rgba(255, 255, 255, 0.06);
+        border-color: rgba(255, 255, 255, 0.22);
+      }
+
+      .game:focus-visible {
+        outline: 2px solid #ffffff;
+        outline-offset: 4px;
+      }
+
+      .game-title {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        font-size: 1.1rem;
+        font-weight: 700;
+      }
+
+      .arrow {
+        color: var(--muted);
+        font-size: 1.1rem;
+      }
+
+      .game-copy {
+        margin: 10px 0 0;
+        color: var(--muted);
+        line-height: 1.6;
+        font-size: 0.95rem;
+      }
+
+      .footer {
+        margin-top: 18px;
+        color: rgba(226, 232, 240, 0.58);
+        font-size: 0.84rem;
+      }
+
+      @media (max-width: 720px) {
+        body {
+          padding: 16px;
+        }
+
+        .frame {
+          padding: 24px;
+          border-radius: 22px;
+        }
+
+        .games {
+          grid-template-columns: 1fr;
+        }
+      }
     </style>
   </head>
   <body>
-    <div class="card">
-      <h1>Church Games</h1>
-      <p>Choose a game to play.</p>
-      <div class="row">
-        <a class="bible" href="/bibletimeline">Play Bible Timeline</a>
-        <a class="npat" href="/nameplaceanimalthing">Play Name Place Animal Thing</a>
-      </div>
-      <div class="small">Single Render Web Service launcher</div>
-    </div>
+    <main>
+      <section class="frame">
+        <p class="eyebrow">Church Games</p>
+        <h1>Choose a game.</h1>
+        <p class="intro">
+          A simple launcher for your group. Pick the Bible challenge or the party game and start playing.
+        </p>
+
+        <div class="games" aria-label="Available games">
+          <a class="game" href="/bibletimeline">
+            <div class="game-title">
+              <span>Bible Timeline</span>
+              <span class="arrow" aria-hidden="true">&rarr;</span>
+            </div>
+            <p class="game-copy">Order key events across scripture in solo or PvP play.</p>
+          </a>
+
+          <a class="game" href="/nameplaceanimalthing">
+            <div class="game-title">
+              <span>Name Place Animal Thing</span>
+              <span class="arrow" aria-hidden="true">&rarr;</span>
+            </div>
+            <p class="game-copy">Fast multiplayer category rounds with live scoring.</p>
+          </a>
+        </div>
+
+        <p class="footer">One launcher, two games.</p>
+      </section>
+    </main>
   </body>
 </html>`;
 

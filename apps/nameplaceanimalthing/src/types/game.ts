@@ -36,4 +36,11 @@ export type GameRoomState = {
   roundBreakdown: RoundBreakdown;
   scoringAssignments?: Record<string, string[]>;
   manualScoreLocks?: Record<string, Record<string, boolean>>;
+  hasSubmittedScores?: boolean;
+  scoringProgress?: {
+    submitted: number;
+    expected: number;
+  };
+  awaitingReconnectUsers?: string[];
+  requiresHostScoringOverride?: boolean;
 };

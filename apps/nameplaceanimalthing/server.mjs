@@ -12,6 +12,7 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1";
 const OPENAI_MAX_CONCURRENT_REQUESTS = Math.max(1, Number(process.env.OPENAI_MAX_CONCURRENT_REQUESTS || 2));
 const ROUND_DURATION_MS = 60_000;
 const DISCONNECT_GRACE_MS = 90_000;
+const SCORING_DISCONNECT_GRACE_MS = 20_000;
 
 let activeOpenAIRequests = 0;
 const openAIQueue = [];
@@ -696,6 +697,30 @@ app.prepare().then(() => {
   const rooms = new Map();
   const presence = new Map();
   const roundTimeouts = new Map();
+  const scoringDisconnectTimeouts = new Map();
+
+  const getScoringDisconnectKey = (roomCode, userId) => `${roomCode}:${userId}`;
+
+  const clearScoringDisconnectTimeout = (roomCode, userId) => {
+    const key = getScoringDisconnectKey(roomCode, userId);
+    const timeout = scoringDisconnectTimeouts.get(key);
+    if (timeout) {
+      clearTimeout(timeout);
+      scoringDisconnectTimeouts.delete(key);
+    }
+  };
+
+  const clearScoringDisconnectTimersForRoom = (room) => {
+    if (!room) {
+      return;
+    }
+
+    for (const user of room.users || []) {
+      clearScoringDisconnectTimeout(room.code, user.id);
+    }
+
+    room.scoringDisconnectDeadlines = {};
+  };
 
   const clearRoomCleanup = (room) => {
     if (room?.cleanupTimeout) {
@@ -848,6 +873,7 @@ app.prepare().then(() => {
     const room = rooms.get(roomCode);
     clearRoomCleanup(room);
     clearRoundTimeout(roomCode);
+    clearScoringDisconnectTimersForRoom(room);
     io.to(roomCode).emit("room-closed", { reason });
     io.in(roomCode).socketsLeave(roomCode);
 
@@ -907,6 +933,183 @@ app.prepare().then(() => {
     return Object.fromEntries(targetIds.map((targetId) => [targetId, room.manualScoreLocks?.[targetId] || {}]));
   };
 
+  const isWithinScoringGrace = (room, userId) => {
+    const deadline = Number(room.scoringDisconnectDeadlines?.[userId] || 0);
+    return deadline > Date.now();
+  };
+
+  const getAwaitingReconnectUsers = (room) => {
+    if (room.phase !== "scoring") {
+      return [];
+    }
+
+    return room.users
+      .filter((user) => user.connected === false)
+      .filter((user) => (room.scoringAssignments?.[user.id] || []).length > 0)
+      .filter((user) => isWithinScoringGrace(room, user.id))
+      .map((user) => user.username);
+  };
+
+  const getRequiredScorerIds = (room) => room.users
+    .filter((user) => user.connected !== false || isWithinScoringGrace(room, user.id))
+    .map((user) => user.id)
+    .filter((userId) => (room.scoringAssignments?.[userId] || []).length > 0);
+
+  const getPendingRequiredScorerIds = (room) => getRequiredScorerIds(room)
+    .filter((userId) => !room.scoreSheets[userId]);
+
+  const getScoringProgress = (room) => {
+    if (room.phase !== "scoring") {
+      return null;
+    }
+
+    const requiredScorers = getRequiredScorerIds(room);
+    const submittedScorers = requiredScorers.filter((userId) => Boolean(room.scoreSheets[userId]));
+
+    return {
+      submitted: submittedScorers.length,
+      expected: requiredScorers.length,
+    };
+  };
+
+  const hasMissingManualReviews = (room) => {
+    if (room.phase !== "scoring") {
+      return false;
+    }
+
+    const requiredScorers = getRequiredScorerIds(room);
+
+    for (const target of room.users) {
+      for (const category of room.settings.categories) {
+        const targetAnswer = String(room.currentAnswers[target.id]?.[category] || "").trim();
+        const isAutoZero = shouldAutoZeroEntry(targetAnswer);
+        const isLockedDuplicate = Boolean(room.manualScoreLocks?.[target.id]?.[category]);
+
+        if (isAutoZero || isLockedDuplicate) {
+          continue;
+        }
+
+        const values = requiredScorers
+          .filter((graderId) => (room.scoringAssignments?.[graderId] || []).includes(target.id))
+          .map((graderId) => Number(room.scoreSheets[graderId]?.[target.id]?.[category]))
+          .filter((value) => Number.isFinite(value));
+
+        if (values.length === 0) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  };
+
+  const requiresHostScoringOverride = (room) => room.phase === "scoring"
+    && getPendingRequiredScorerIds(room).length === 0
+    && hasMissingManualReviews(room);
+
+  const preserveScoringStateAfterUserLeaves = (room, removedUserId) => {
+    if (room.phase !== "scoring") {
+      return;
+    }
+
+    const activeUserIds = new Set(room.users.map((user) => user.id));
+    const nextAssignments = {};
+    const nextScoreSheets = {};
+
+    for (const user of room.users) {
+      const filteredTargets = (room.scoringAssignments?.[user.id] || [])
+        .filter((targetId) => targetId !== removedUserId && activeUserIds.has(targetId));
+
+      nextAssignments[user.id] = filteredTargets;
+
+      const previousSheet = room.scoreSheets?.[user.id];
+      if (!previousSheet) {
+        continue;
+      }
+
+      const preservedSheet = {};
+      for (const targetId of filteredTargets) {
+        if (!previousSheet[targetId]) {
+          continue;
+        }
+
+        preservedSheet[targetId] = { ...previousSheet[targetId] };
+      }
+
+      if (Object.keys(preservedSheet).length > 0) {
+        nextScoreSheets[user.id] = preservedSheet;
+      }
+    }
+
+    room.scoringAssignments = nextAssignments;
+    room.manualScoreLocks = buildManualDuplicateLocks(room);
+    room.scoreSheets = nextScoreSheets;
+    delete room.scoringDisconnectDeadlines?.[removedUserId];
+  };
+
+  const buildFallbackManualScore = (room, targetId, category) => {
+    const targetAnswer = String(room.currentAnswers[targetId]?.[category] || "").trim();
+    const isAutoZero = shouldAutoZeroEntry(targetAnswer);
+    const isLockedDuplicate = Boolean(room.manualScoreLocks?.[targetId]?.[category]);
+    const isLikelyValid = isLikelyValidWord(targetAnswer, room.currentLetter) && isCategoryMatch(category, targetAnswer);
+
+    if (isAutoZero) {
+      return { points: 0, reason: "invalid" };
+    }
+
+    if (isLockedDuplicate) {
+      return { points: 5, reason: "duplicate" };
+    }
+
+    return {
+      points: isLikelyValid ? 10 : 0,
+      reason: isLikelyValid ? "manual" : "invalid",
+    };
+  };
+
+  const finalizeManualScoring = (room) => {
+    const requiredScorers = getRequiredScorerIds(room);
+    const manualBreakdown = {};
+    const roundTotals = {};
+
+    for (const target of room.users) {
+      manualBreakdown[target.id] = {};
+      let total = 0;
+
+      for (const category of room.settings.categories) {
+        const targetAnswer = String(room.currentAnswers[target.id]?.[category] || "").trim();
+        const values = requiredScorers
+          .filter((graderId) => (room.scoringAssignments?.[graderId] || []).includes(target.id))
+          .map((graderId) => Number(room.scoreSheets[graderId]?.[target.id]?.[category]))
+          .filter((value) => Number.isFinite(value));
+
+        const fallback = buildFallbackManualScore(room, target.id, category);
+        const average = values.length > 0
+          ? Math.round(values.reduce((sum, value) => sum + value, 0) / values.length)
+          : fallback.points;
+        const normalized = values.length > 0 ? normalizeManualScore(average) : fallback.points;
+        const reason = values.length > 0 ? fallback.reason === "duplicate" ? "duplicate" : "manual" : fallback.reason;
+
+        manualBreakdown[target.id][category] = {
+          answer: targetAnswer,
+          points: normalized,
+          reason,
+        };
+        total += normalized;
+      }
+
+      roundTotals[target.id] = Math.min(40, total);
+    }
+
+    room.roundBreakdown = manualBreakdown;
+    for (const user of room.users) {
+      room.totalScores[user.id] = (room.totalScores[user.id] || 0) + (roundTotals[user.id] || 0);
+    }
+
+    room.phase = "round-breakdown";
+    emitRoomState(room);
+  };
+
   const buildRoomStateForUser = (room, viewerId) => ({
     code: room.code,
     users: room.users.map(sanitizeUser),
@@ -920,6 +1123,10 @@ app.prepare().then(() => {
     roundBreakdown: room.roundBreakdown,
     scoringAssignments: buildVisibleScoringAssignments(room, viewerId),
     manualScoreLocks: buildVisibleManualScoreLocks(room, viewerId),
+    hasSubmittedScores: room.phase === "scoring" ? Boolean(viewerId && room.scoreSheets?.[viewerId]) : false,
+    scoringProgress: getScoringProgress(room),
+    awaitingReconnectUsers: getAwaitingReconnectUsers(room),
+    requiresHostScoringOverride: requiresHostScoringOverride(room),
   });
 
   const emitUserList = (room, eventName) => {
@@ -1002,6 +1209,7 @@ app.prepare().then(() => {
           roundFinalized: false,
           roundFinalizedBy: null,
           cleanupTimeout: null,
+          scoringDisconnectDeadlines: {},
         };
 
         rooms.set(code, room);
@@ -1021,6 +1229,8 @@ app.prepare().then(() => {
 
           existing.username = username;
           existing.connected = true;
+          clearScoringDisconnectTimeout(code, userId);
+          delete room.scoringDisconnectDeadlines?.[userId];
         } else {
           room.users.push({ id: userId, username, isHost: false, connected: true, authToken: createAuthToken() });
           room.totalScores[userId] = room.totalScores[userId] || 0;
@@ -1170,11 +1380,9 @@ app.prepare().then(() => {
       }
 
       room.scoreSheets[scorerId] = sanitizedScores;
+      emitRoomState(room);
 
-      const requiredScorers = room.users
-        .map((user) => user.id)
-        .filter((userId) => (room.scoringAssignments?.[userId] || []).length > 0);
-
+      const requiredScorers = getRequiredScorerIds(room);
       const scoredUsers = requiredScorers.filter((userId) => Boolean(room.scoreSheets[userId]));
 
       if (scoredUsers.length < requiredScorers.length) {
@@ -1182,50 +1390,40 @@ app.prepare().then(() => {
           submitted: scoredUsers.length,
           expected: requiredScorers.length,
         });
-        callback?.({ ok: true });
+        callback?.({ ok: true, submitted: scoredUsers.length, expected: requiredScorers.length, completed: false });
         return;
       }
 
-      const manualBreakdown = {};
-      const roundTotals = {};
-
-      for (const target of room.users) {
-        manualBreakdown[target.id] = {};
-        let total = 0;
-
-        for (const category of room.settings.categories) {
-          const targetAnswer = String(room.currentAnswers[target.id]?.[category] || "").trim();
-          const isAutoZero = shouldAutoZeroEntry(targetAnswer);
-          const values = requiredScorers
-            .filter((graderId) => (room.scoringAssignments?.[graderId] || []).includes(target.id))
-            .map((graderId) => Number(room.scoreSheets[graderId]?.[target.id]?.[category] ?? 0))
-            .filter((value) => Number.isFinite(value));
-
-          const average = values.length > 0
-            ? Math.round(values.reduce((sum, value) => sum + value, 0) / values.length)
-            : 0;
-
-          const isLockedDuplicate = Boolean(room.manualScoreLocks?.[target.id]?.[category]);
-          const normalized = isAutoZero ? 0 : (isLockedDuplicate ? 5 : normalizeManualScore(average));
-
-          manualBreakdown[target.id][category] = {
-            answer: targetAnswer,
-            points: normalized,
-            reason: isAutoZero ? "invalid" : (isLockedDuplicate ? "duplicate" : "manual"),
-          };
-          total += normalized;
-        }
-
-        roundTotals[target.id] = Math.min(40, total);
+      if (requiresHostScoringOverride(room)) {
+        callback?.({
+          ok: true,
+          submitted: scoredUsers.length,
+          expected: requiredScorers.length,
+          completed: false,
+          requiresHostOverride: true,
+        });
+        emitRoomState(room);
+        return;
       }
 
-      room.roundBreakdown = manualBreakdown;
-      for (const user of room.users) {
-        room.totalScores[user.id] = (room.totalScores[user.id] || 0) + (roundTotals[user.id] || 0);
+      finalizeManualScoring(room);
+      callback?.({ ok: true, submitted: scoredUsers.length, expected: requiredScorers.length, completed: true });
+    });
+
+    socket.on("force-complete-scoring", (payload, callback) => {
+      const room = getRoomBySocket(socket);
+      if (!room || room.phase !== "scoring" || payload?.code !== room.code) {
+        callback?.({ ok: false, message: "Round is not in manual scoring phase." });
+        return;
       }
 
-      room.phase = "round-breakdown";
-      emitRoomState(room);
+      const requester = getAuthorizedUser(room, socket, payload);
+      if (!requester?.isHost) {
+        callback?.({ ok: false, message: "Only host can continue." });
+        return;
+      }
+
+      finalizeManualScoring(room);
       callback?.({ ok: true });
     });
 
@@ -1269,6 +1467,7 @@ app.prepare().then(() => {
         room.scoreSheets = {};
         room.scoringAssignments = {};
         room.manualScoreLocks = {};
+        clearScoringDisconnectTimersForRoom(room);
         room.roundFinalized = false;
         room.roundFinalizedBy = null;
         room.roundEndsAt = 0;
@@ -1341,9 +1540,8 @@ app.prepare().then(() => {
       }
 
       if (room.phase === "scoring") {
-        room.scoringAssignments = generateManualScoringAssignments(room.users);
-        room.manualScoreLocks = buildManualDuplicateLocks(room);
-        room.scoreSheets = {};
+        preserveScoringStateAfterUserLeaves(room, userId);
+        clearScoringDisconnectTimeout(code, userId);
       }
 
       emitUserList(room, "user-left");
@@ -1370,6 +1568,30 @@ app.prepare().then(() => {
       }
 
       leavingUser.connected = false;
+
+      if (room.phase === "scoring") {
+        room.scoringDisconnectDeadlines = room.scoringDisconnectDeadlines || {};
+        room.scoringDisconnectDeadlines[leavingUser.id] = Date.now() + SCORING_DISCONNECT_GRACE_MS;
+        clearScoringDisconnectTimeout(room.code, leavingUser.id);
+
+        const timeout = setTimeout(() => {
+          const liveRoom = rooms.get(room.code);
+          if (!liveRoom || liveRoom.phase !== "scoring") {
+            return;
+          }
+
+          const disconnectedUser = liveRoom.users.find((user) => user.id === leavingUser.id);
+          if (!disconnectedUser || disconnectedUser.connected !== false) {
+            return;
+          }
+
+          delete liveRoom.scoringDisconnectDeadlines?.[leavingUser.id];
+          emitRoomState(liveRoom);
+        }, SCORING_DISCONNECT_GRACE_MS);
+
+        scoringDisconnectTimeouts.set(getScoringDisconnectKey(room.code, leavingUser.id), timeout);
+      }
+
       scheduleRoomCleanupIfEmpty(room);
       emitUserList(room, "user-left");
       emitRoomState(room);

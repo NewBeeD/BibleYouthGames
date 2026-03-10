@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { getSocket } from "../../../lib/socket";
@@ -31,6 +31,43 @@ const getAlphabeticLength = (value: string) => (value.match(/[A-Za-z]/g) || []).
 
 const isTooShortAnswer = (value: string) => getAlphabeticLength(String(value || "").trim()) < 2;
 
+const buildManualScoreDraftKey = (roomCode: string, userId: string, round: number) =>
+  `npat-manual-score-draft:${roomCode}:${userId}:${round}`;
+
+const readManualScoreDraft = (storageKey: string) => {
+  try {
+    const rawValue = window.localStorage.getItem(storageKey);
+    if (!rawValue) {
+      return null;
+    }
+
+    const parsed = JSON.parse(rawValue);
+    return parsed && typeof parsed === "object" ? parsed as Record<string, Record<string, number>> : null;
+  } catch {
+    return null;
+  }
+};
+
+const writeManualScoreDraft = (storageKey: string, value: Record<string, Record<string, number>>) => {
+  try {
+    window.localStorage.setItem(storageKey, JSON.stringify(value));
+  } catch {
+    // Ignore storage failures and keep scoring usable.
+  }
+};
+
+const clearManualScoreDraft = (storageKey: string | null) => {
+  if (!storageKey) {
+    return;
+  }
+
+  try {
+    window.localStorage.removeItem(storageKey);
+  } catch {
+    // Ignore storage failures and keep scoring usable.
+  }
+};
+
 export default function GamePage() {
   const router = useRouter();
   const params = useParams<{ code: string }>();
@@ -42,9 +79,85 @@ export default function GamePage() {
   const [scoreSheet, setScoreSheet] = useState<Record<string, Record<string, number>>>({});
   const [status, setStatus] = useState("");
   const [nowTimestamp, setNowTimestamp] = useState(Date.now());
+  const [isSubmittingScores, setIsSubmittingScores] = useState(false);
+  const [showReconnectPrompt, setShowReconnectPrompt] = useState(false);
+  const [isRejoining, setIsRejoining] = useState(false);
+  const [reconnectError, setReconnectError] = useState("");
+  const [showForceCompleteConfirm, setShowForceCompleteConfirm] = useState(false);
+  const lastManualScoreDraftKeyRef = useRef<string | null>(null);
 
   const me = game?.users.find((user) => user.id === session?.userId);
   const isHost = Boolean(me?.isHost);
+  const hasSubmittedScores = Boolean(game?.hasSubmittedScores);
+  const manualScoreDraftKey = useMemo(() => {
+    if (!game || !session || game.phase !== "scoring" || hasSubmittedScores) {
+      return null;
+    }
+
+    return buildManualScoreDraftKey(game.code, session.userId, game.currentRound);
+  }, [game, hasSubmittedScores, session]);
+
+  const goToJoinPage = () => {
+    reset();
+    router.replace("/join");
+  };
+
+  const setStatusMessage = (message: string) => {
+    setStatus(message);
+  };
+
+  const attemptJoinRoom = useCallback((socket: Awaited<ReturnType<typeof getSocket>>) => {
+    if (!session) {
+      return;
+    }
+
+    socket.emit("join-room", {
+      code: session.code,
+      userId: session.userId,
+      username: session.username,
+      authToken: session.authToken,
+    }, (response: { ok: boolean; message?: string }) => {
+      if (response?.ok) {
+        setIsRejoining(false);
+        setShowReconnectPrompt(false);
+        setReconnectError("");
+        setStatusMessage("Rejoined room successfully.");
+        return;
+      }
+
+      setIsRejoining(false);
+      setReconnectError(response?.message || "Could not rejoin room.");
+      setShowReconnectPrompt(true);
+      setStatusMessage(response?.message || "Could not rejoin room.");
+    });
+  }, [session]);
+
+  const joinExistingRoom = useCallback((socket: Awaited<ReturnType<typeof getSocket>>) => {
+    attemptJoinRoom(socket);
+  }, [attemptJoinRoom]);
+
+  const rejoinCurrentRoom = useCallback(async () => {
+    if (!session) {
+      return;
+    }
+
+    try {
+      setIsRejoining(true);
+      setReconnectError("");
+      const socket = await getSocket();
+
+      if (!socket.connected) {
+        socket.connect();
+        return;
+      }
+
+      joinExistingRoom(socket);
+    } catch {
+      setIsRejoining(false);
+      setReconnectError("Could not reconnect. Try rejoining again.");
+      setStatusMessage("Could not reconnect. Try rejoining again.");
+    }
+  }, [joinExistingRoom, session]);
 
   useEffect(() => {
     if (!session || session.code !== roomCode) {
@@ -64,7 +177,13 @@ export default function GamePage() {
           }
 
           setGame(room);
-          setStatus("");
+
+          const viewer = room.users.find((user) => user.id === session.userId);
+          if (viewer?.connected !== false) {
+            setShowReconnectPrompt(false);
+            setIsRejoining(false);
+            setReconnectError("");
+          }
         };
 
         const handleRoundStart = () => {
@@ -73,7 +192,7 @@ export default function GamePage() {
           }
 
           setAnswers({});
-          setStatus("New round started.");
+          setStatusMessage("New round started.");
         };
 
         const handleSubmitError = (payload: { message?: string }) => {
@@ -81,7 +200,7 @@ export default function GamePage() {
             return;
           }
 
-          setStatus(payload?.message || "Could not submit response.");
+          setStatusMessage(payload?.message || "Could not submit response.");
         };
 
         const handleAiComplete = () => {
@@ -89,7 +208,7 @@ export default function GamePage() {
             return;
           }
 
-          setStatus("AI grading complete.");
+          setStatusMessage("AI grading complete.");
         };
 
         const handleManualScoringRequired = () => {
@@ -97,7 +216,7 @@ export default function GamePage() {
             return;
           }
 
-          setStatus("AI unavailable. Switching to peer scoring for this round.");
+          setStatusMessage("AI unavailable. Switching to peer scoring for this round.");
         };
 
         const handleScoresSubmitted = (payload: { submitted: number; expected: number }) => {
@@ -105,7 +224,7 @@ export default function GamePage() {
             return;
           }
 
-          setStatus(`Scores submitted: ${payload.submitted}/${payload.expected}`);
+          setStatusMessage(`Scores submitted: ${payload.submitted}/${payload.expected}`);
         };
 
         const handleGameEnd = () => {
@@ -113,7 +232,7 @@ export default function GamePage() {
             return;
           }
 
-          setStatus("Game ended.");
+          setStatusMessage("Game ended.");
         };
 
         const handleRoomClosed = (payload: { reason?: string }) => {
@@ -121,30 +240,26 @@ export default function GamePage() {
             return;
           }
 
-          setStatus(payload?.reason || "Host left. Room closed.");
+          setStatusMessage(payload?.reason || "Host left. Room closed.");
           setTimeout(() => {
             reset();
             router.replace("/");
           }, 900);
         };
 
-        const joinRoom = () => {
-          socket.emit("join-room", {
-            code: session.code,
-            userId: session.userId,
-            username: session.username,
-            authToken: session.authToken,
-          }, (response: { ok: boolean; message?: string }) => {
-            if (!mounted || response?.ok) {
-              return;
-            }
+        const handleDisconnect = () => {
+          if (!mounted) {
+            return;
+          }
 
-            setStatus(response?.message || "Could not rejoin room.");
-            setTimeout(() => {
-              reset();
-              router.replace("/join");
-            }, 900);
-          });
+          setShowReconnectPrompt(true);
+          setIsRejoining(false);
+          setReconnectError("");
+          setStatusMessage("Connection lost. Rejoin the room to keep playing.");
+        };
+
+        const joinRoom = () => {
+          joinExistingRoom(socket);
         };
 
         socket.on("room-state", handleRoomState);
@@ -155,6 +270,7 @@ export default function GamePage() {
         socket.on("scores-submitted", handleScoresSubmitted);
         socket.on("game-end", handleGameEnd);
         socket.on("room-closed", handleRoomClosed);
+        socket.on("disconnect", handleDisconnect);
         socket.on("connect", joinRoom);
 
         joinRoom();
@@ -168,10 +284,13 @@ export default function GamePage() {
           socket.off("scores-submitted", handleScoresSubmitted);
           socket.off("game-end", handleGameEnd);
           socket.off("room-closed", handleRoomClosed);
+          socket.off("disconnect", handleDisconnect);
           socket.off("connect", joinRoom);
         };
       } catch {
         setError("Socket connection failed.");
+        setReconnectError("Socket connection failed.");
+        setShowReconnectPrompt(true);
       }
     };
 
@@ -181,7 +300,7 @@ export default function GamePage() {
       mounted = false;
       cleanupPromise.then((cleanup) => cleanup?.());
     };
-  }, [reset, roomCode, router, session, setError, setGame]);
+  }, [joinExistingRoom, reset, roomCode, router, session, setError, setGame]);
 
   useEffect(() => {
     if (!game || !session || game.phase !== "play") {
@@ -218,24 +337,68 @@ export default function GamePage() {
 
     if (game.phase !== "scoring") {
       setScoreSheet({});
+      setIsSubmittingScores(false);
       return;
     }
 
     const assignedTargets = game.scoringAssignments?.[session.userId] || [];
     setScoreSheet((previous) => {
+      const savedDraft = manualScoreDraftKey ? readManualScoreDraft(manualScoreDraftKey) : null;
       const next: Record<string, Record<string, number>> = {};
 
       for (const targetId of assignedTargets) {
         next[targetId] = {};
         for (const category of game.settings.categories) {
           const isLockedDuplicate = Boolean(game.manualScoreLocks?.[targetId]?.[category]);
-          next[targetId][category] = isLockedDuplicate ? 5 : (previous[targetId]?.[category] ?? 0);
+          next[targetId][category] = isLockedDuplicate
+            ? 5
+            : (savedDraft?.[targetId]?.[category] ?? previous[targetId]?.[category] ?? 0);
         }
       }
 
       return next;
     });
-  }, [game, session]);
+  }, [game, manualScoreDraftKey, session]);
+
+  useEffect(() => {
+    const previousDraftKey = lastManualScoreDraftKeyRef.current;
+
+    if (previousDraftKey && previousDraftKey !== manualScoreDraftKey) {
+      clearManualScoreDraft(previousDraftKey);
+    }
+
+    if (!manualScoreDraftKey || hasSubmittedScores) {
+      if (manualScoreDraftKey) {
+        clearManualScoreDraft(manualScoreDraftKey);
+      }
+      lastManualScoreDraftKeyRef.current = null;
+      return;
+    }
+
+    lastManualScoreDraftKeyRef.current = manualScoreDraftKey;
+  }, [hasSubmittedScores, manualScoreDraftKey]);
+
+  useEffect(() => {
+    if (!game || !session || game.phase !== "scoring" || !manualScoreDraftKey || hasSubmittedScores) {
+      return;
+    }
+
+    const assignedTargets = game.scoringAssignments?.[session.userId] || [];
+    if (assignedTargets.length === 0) {
+      clearManualScoreDraft(manualScoreDraftKey);
+      return;
+    }
+
+    const draft: Record<string, Record<string, number>> = {};
+    for (const targetId of assignedTargets) {
+      draft[targetId] = {};
+      for (const category of game.settings.categories) {
+        draft[targetId][category] = scoreSheet[targetId]?.[category] ?? 0;
+      }
+    }
+
+    writeManualScoreDraft(manualScoreDraftKey, draft);
+  }, [game, hasSubmittedScores, manualScoreDraftKey, scoreSheet, session]);
 
   const startGame = async () => {
     if (!session) {
@@ -253,13 +416,13 @@ export default function GamePage() {
 
     const allFilled = game.settings.categories.every((category) => Boolean(String(answers[category] || "").trim()));
     if (!allFilled) {
-      setStatus("Fill all fields before submitting.");
+        setStatusMessage("Fill all fields before submitting.");
       return;
     }
 
     const hasSingleLetterEntry = game.settings.categories.some((category) => isTooShortAnswer(String(answers[category] || "")));
     if (hasSingleLetterEntry) {
-      setStatus("Each answer must be at least 2 letters.");
+      setStatusMessage("Each answer must be at least 2 letters.");
       return;
     }
 
@@ -289,10 +452,55 @@ export default function GamePage() {
     }
 
     const socket = await getSocket();
+    setIsSubmittingScores(true);
     socket.emit("submit-scores", {
       code: game.code,
       authToken: session.authToken,
       scores: scoreSheet,
+    }, (response: { ok: boolean; message?: string; submitted?: number; expected?: number; completed?: boolean; requiresHostOverride?: boolean }) => {
+      setIsSubmittingScores(false);
+
+      if (!response?.ok) {
+        setStatusMessage(response?.message || "Could not submit scores.");
+        return;
+      }
+
+      if (manualScoreDraftKey) {
+        clearManualScoreDraft(manualScoreDraftKey);
+      }
+      lastManualScoreDraftKeyRef.current = null;
+
+      if (response.completed) {
+        setStatusMessage("Scores submitted. Moving to round breakdown.");
+        return;
+      }
+
+      if ("requiresHostOverride" in response && response.requiresHostOverride) {
+        setStatusMessage("Some reviews are missing because a scorer left or did not return. The host must confirm fallback scoring.");
+        return;
+      }
+
+      setStatusMessage(`Scores submitted successfully. Waiting for others (${response.submitted ?? 0}/${response.expected ?? 0}).`);
+    });
+  };
+
+  const forceCompleteScoring = async () => {
+    if (!game || !session || game.phase !== "scoring") {
+      return;
+    }
+
+    const socket = await getSocket();
+    socket.emit("force-complete-scoring", {
+      code: game.code,
+      authToken: session.authToken,
+    }, (response: { ok: boolean; message?: string }) => {
+      if (!response?.ok) {
+        setStatusMessage(response?.message || "Could not continue round.");
+        return;
+      }
+
+      setShowForceCompleteConfirm(false);
+      setStatusMessage("Continuing with submitted scores and automatic fallback for missing reviews.");
     });
   };
 
@@ -310,6 +518,11 @@ export default function GamePage() {
     ? (game.scoringAssignments?.[session.userId] || [])
     : [];
   const scoringTargets = game?.users.filter((player) => scoringTargetIds.includes(player.id)) || [];
+  const awaitingReconnectUsers = game?.awaitingReconnectUsers || [];
+  const requiresHostScoringOverride = Boolean(game?.requiresHostScoringOverride);
+  const scoringProgressLabel = game?.scoringProgress
+    ? `${game.scoringProgress.submitted}/${game.scoringProgress.expected}`
+    : null;
   const timeLeftMs = game?.phase === "play" && game?.roundEndsAt
     ? Math.max(0, game.roundEndsAt - nowTimestamp)
     : 0;
@@ -321,11 +534,16 @@ export default function GamePage() {
 
   const copyCode = async () => {
     await navigator.clipboard.writeText(roomCode);
-    setStatus("Game code copied.");
+    setStatusMessage("Game code copied.");
   };
 
   const onExit = async () => {
     try {
+      if (lastManualScoreDraftKeyRef.current) {
+        clearManualScoreDraft(lastManualScoreDraftKeyRef.current);
+        lastManualScoreDraftKeyRef.current = null;
+      }
+
       if (session) {
         const socket = await getSocket();
         await new Promise<void>((resolve) => {
@@ -353,6 +571,62 @@ export default function GamePage() {
 
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top,_#06b6d4_0%,_#4f46e5_40%,_#0f172a_100%)] px-4 py-4 text-white sm:px-6 sm:py-6">
+      {showReconnectPrompt ? (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/80 px-4 py-6 backdrop-blur-sm">
+          <div className="glass-panel w-full max-w-md space-y-4 border border-rose-300/40 bg-slate-950/90 p-6 text-left shadow-2xl">
+            <div className="space-y-2">
+              <p className="text-sm font-semibold uppercase tracking-[0.22em] text-rose-200">Connection Lost</p>
+              <h2 className="text-2xl font-extrabold">Rejoin your game</h2>
+              <p className="text-sm leading-6 text-slate-200/90">
+                Your device lost contact with the room. Rejoin now to keep your place in the current game.
+              </p>
+              {reconnectError ? (
+                <p className="rounded-lg border border-rose-400/30 bg-rose-500/15 px-3 py-2 text-sm text-rose-100">
+                  {reconnectError}
+                </p>
+              ) : null}
+            </div>
+
+            <div className="flex flex-col gap-3 sm:flex-row">
+              <button
+                type="button"
+                onClick={rejoinCurrentRoom}
+                disabled={isRejoining}
+                className="fun-button w-full text-center disabled:opacity-60"
+              >
+                {isRejoining ? "Rejoining..." : "Rejoin Room"}
+              </button>
+              <button type="button" onClick={goToJoinPage} className="soft-button w-full text-center">
+                Return to Join
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {showForceCompleteConfirm ? (
+        <div className="fixed inset-0 z-[95] flex items-center justify-center bg-slate-950/70 px-4 py-6 backdrop-blur-sm">
+          <div className="glass-panel w-full max-w-lg space-y-4 border border-amber-300/40 bg-slate-950/90 p-6 text-left shadow-2xl">
+            <div className="space-y-2">
+              <p className="text-sm font-semibold uppercase tracking-[0.22em] text-amber-200">Confirm Fallback Scoring</p>
+              <h2 className="text-2xl font-extrabold">Continue without all reviews?</h2>
+              <p className="text-sm leading-6 text-slate-200/90">
+                This will finish the round using submitted score sheets plus automatic fallback scoring for anything still missing.
+              </p>
+            </div>
+
+            <div className="flex flex-col gap-3 sm:flex-row">
+              <button type="button" onClick={forceCompleteScoring} className="fun-button w-full text-center">
+                Confirm and Continue
+              </button>
+              <button type="button" onClick={() => setShowForceCompleteConfirm(false)} className="soft-button w-full text-center">
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {game?.phase === "scoring" ? (
         <div className="mx-auto mb-3 w-full max-w-6xl rounded-xl border border-amber-300/50 bg-amber-400/20 px-4 py-3 text-center text-sm font-semibold text-amber-100">
           AI offline — manual scoring enabled
@@ -477,8 +751,26 @@ export default function GamePage() {
         <section className="glass-panel mx-auto w-full max-w-6xl space-y-4 p-5 sm:p-6">
           <h2 className="text-xl font-extrabold">Manual Peer Scoring (AI Fallback)</h2>
           <p className="text-sm opacity-80">AI is unavailable. Score your assigned player(s) as 0, 5, or 10.</p>
+          {scoringProgressLabel ? (
+            <p className="text-sm text-cyan-100">Score submissions: {scoringProgressLabel}</p>
+          ) : null}
+          {awaitingReconnectUsers.length > 0 ? (
+            <p className="text-sm text-sky-100">
+              Waiting for reconnect: {awaitingReconnectUsers.join(", ")}
+            </p>
+          ) : null}
+          {requiresHostScoringOverride ? (
+            <p className="text-sm text-amber-100">
+              A missing review still needs host confirmation before fallback scoring is used.
+            </p>
+          ) : null}
           {isHost && game.users.length % 2 === 1 ? (
             <p className="text-xs text-violet-200/90">Odd players: host scores one extra submission.</p>
+          ) : null}
+          {hasSubmittedScores ? (
+            <div className="rounded-xl border border-emerald-400/40 bg-emerald-500/15 px-4 py-3 text-sm font-semibold text-emerald-100">
+              Scores submitted successfully. Waiting for the rest of the round to resolve.
+            </div>
           ) : null}
 
           <div className="space-y-4">
@@ -505,6 +797,10 @@ export default function GamePage() {
                         <button
                           type="button"
                           onClick={() => {
+                            if (hasSubmittedScores) {
+                              return;
+                            }
+
                             if (isLockedDuplicate) {
                               return;
                             }
@@ -520,7 +816,7 @@ export default function GamePage() {
                               },
                             }));
                           }}
-                          disabled={isLockedDuplicate || currentValue <= 0}
+                          disabled={hasSubmittedScores || isLockedDuplicate || currentValue <= 0}
                           className="soft-button px-3 py-1 text-sm disabled:opacity-40"
                         >
                           −
@@ -533,6 +829,10 @@ export default function GamePage() {
                         <button
                           type="button"
                           onClick={() => {
+                            if (hasSubmittedScores) {
+                              return;
+                            }
+
                             if (isLockedDuplicate) {
                               return;
                             }
@@ -548,7 +848,7 @@ export default function GamePage() {
                               },
                             }));
                           }}
-                          disabled={isLockedDuplicate || currentValue >= 10}
+                          disabled={hasSubmittedScores || isLockedDuplicate || currentValue >= 10}
                           className="soft-button px-3 py-1 text-sm disabled:opacity-40"
                         >
                           +
@@ -572,10 +872,26 @@ export default function GamePage() {
             type="button"
             onClick={submitScores}
             className="fun-button w-full sm:w-auto"
-            disabled={scoringTargets.length === 0}
+            disabled={scoringTargets.length === 0 || hasSubmittedScores || isSubmittingScores}
           >
-            Submit Scores
+            {hasSubmittedScores ? "Scores Submitted" : isSubmittingScores ? "Submitting Scores..." : "Submit Scores"}
           </button>
+
+          {isHost ? (
+            <button
+              type="button"
+              onClick={() => setShowForceCompleteConfirm(true)}
+              className="soft-button w-full sm:w-auto"
+            >
+              Continue Without Missing Scores
+            </button>
+          ) : null}
+
+          {isHost ? (
+            <p className="text-xs opacity-70">
+              Use this only if someone stops responding. Missing manual reviews will fall back to automatic validation.
+            </p>
+          ) : null}
         </section>
       ) : null}
 
