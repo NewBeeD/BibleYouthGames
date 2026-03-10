@@ -32,6 +32,17 @@
    - `Classic` and `Speed` show Easy/Medium/Hard columns
    - `PvP` shows Wins/Total/Best columns
 
+## Reconnect checks
+
+1. Start a PvP match with two browser sessions.
+2. Complete at least one round so both players have visible score data.
+3. During lobby, round, and results screens, refresh one player's tab.
+4. Verify the refreshed player returns to the same room and existing player slot.
+5. Verify the refreshed player keeps accumulated score and current reconnectable state.
+6. During an active round, verify the disconnected player is shown as disconnected, then returns to connected after reconnect.
+7. Verify a second client cannot take over another player's slot without that player's stored session token.
+8. Verify host-only actions still work only for the real host after reconnect.
+
 ## Data checks (Realtime Database)
 
 After playing, verify user records under:

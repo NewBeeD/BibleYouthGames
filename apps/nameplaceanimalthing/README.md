@@ -40,6 +40,15 @@ Open `http://localhost:3000`.
 - In-memory room state is used for MVP and resets on restart.
 - AI grading uses OpenAI Responses API when `OPENAI_API_KEY` is configured.
 - If AI is unavailable, server falls back to local heuristic validation.
+- Multiplayer actions use a server-issued session token after room join/create.
+- Temporary disconnects keep the player slot and score so the same browser session can rejoin.
+- Scoring assignments and manual score locks are emitted per player instead of being broadcast to the whole room.
+
+## Reconnect behavior
+
+- Refreshing or reconnecting from the same browser profile should restore the same room membership.
+- If the server rejects a reconnect token, the client is sent back to join/create flow.
+- Active matches still live only in server memory, so a full server restart clears room state.
 
 ## AI Validation Setup
 
