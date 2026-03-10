@@ -6,6 +6,7 @@ import RemoveRoundedIcon from '@mui/icons-material/RemoveRounded'
 import { ensurePvpSocketConnected, emitPvpAck, getPvpServerUrl } from '../modules/pvpSocket'
 import { PvpConnectionBadge } from '../components/PvpConnectionBadge'
 import { getPvpAnimalAvatars, loadPvpIdentity, savePvpIdentity } from '../modules/pvpIdentity'
+import { savePvpSession } from '../modules/pvpSession'
 
 export const PvpJoinMatch = () => {
   const navigate = useNavigate()
@@ -54,11 +55,17 @@ export const PvpJoinMatch = () => {
         name: displayName,
         avatarIndex
       })
+      savePvpSession({
+        roomCode: response.roomCode,
+        playerId: response.playerId,
+        authToken: response.authToken
+      })
 
       navigate('/pvp/lobby', {
         state: {
           roomCode: response.roomCode,
           playerId: response.playerId,
+          authToken: response.authToken,
           host: false
         }
       })

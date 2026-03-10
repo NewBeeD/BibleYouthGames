@@ -5,13 +5,16 @@ import { DragDropContext, Draggable, Droppable } from '@hello-pangea/dnd'
 import { getPvpSocket } from '../modules/pvpSocket'
 import { getLevelName, PVP_MODES } from '../modules/gameModes'
 import { PvpConnectionBadge } from '../components/PvpConnectionBadge'
+import { clearPvpSession, loadPvpSession } from '../modules/pvpSession'
 
 export const PvpRound = () => {
   const location = useLocation()
   const navigate = useNavigate()
 
-  const roomCode = location.state?.roomCode
-  const playerId = location.state?.playerId
+  const savedSession = loadPvpSession()
+  const roomCode = location.state?.roomCode || savedSession?.roomCode
+  const playerId = location.state?.playerId || savedSession?.playerId
+  const authToken = location.state?.authToken || savedSession?.authToken
 
   const [round, setRound] = useState(null)
   const [data, setData] = useState([])
@@ -43,12 +46,16 @@ export const PvpRound = () => {
   }, [round, pvpMode])
 
   useEffect(() => {
-    if(!roomCode || !playerId){
+    if(!roomCode || !playerId || !authToken){
       navigate('/pvp/join', { replace: true })
       return
     }
 
     const socket = getPvpSocket()
+
+    const syncRoomState = () => {
+      socket.emit('get_room_state', { roomCode, playerId, authToken })
+    }
 
     const hydrateRaceRound = (payload) => {
       const challenges = payload?.challenges || []
@@ -93,6 +100,7 @@ export const PvpRound = () => {
         state: {
           roomCode,
           playerId,
+          authToken,
           roundResults: payload
         }
       })
@@ -171,6 +179,7 @@ export const PvpRound = () => {
 
     const handleRoomClosed = (payload) => {
       if(payload?.roomCode === roomCode){
+        clearPvpSession()
         navigate('/pvp/join', { replace: true })
       }
     }
@@ -188,8 +197,9 @@ export const PvpRound = () => {
     socket.on('room_error', handleRoomError)
     socket.on('problem_feedback', handleProblemFeedback)
     socket.on('race_progress_update', handleRaceProgressUpdate)
+    socket.on('connect', syncRoomState)
 
-    socket.emit('get_room_state', { roomCode })
+    syncRoomState()
 
     return () => {
       socket.off('round_started', handleRoundStarted)
@@ -199,8 +209,9 @@ export const PvpRound = () => {
       socket.off('room_error', handleRoomError)
       socket.off('problem_feedback', handleProblemFeedback)
       socket.off('race_progress_update', handleRaceProgressUpdate)
+      socket.off('connect', syncRoomState)
     }
-  }, [navigate, roomCode, playerId, round?.roundId])
+  }, [authToken, navigate, roomCode, playerId, round?.roundId])
 
   useEffect(() => {
     if(!round?.endsAt){
@@ -266,7 +277,7 @@ export const PvpRound = () => {
     const socket = getPvpSocket()
     socket.emit('submit_order', {
       roomCode,
-      playerId,
+      authToken,
       roundId: round.roundId,
       submittedOrder
     })
@@ -283,7 +294,7 @@ export const PvpRound = () => {
     const socket = getPvpSocket()
     socket.emit('submit_problem_order', {
       roomCode,
-      playerId,
+      authToken,
       roundId: round.roundId,
       challengeId,
       submittedOrder
@@ -292,7 +303,8 @@ export const PvpRound = () => {
 
   const leaveGame = () => {
     const socket = getPvpSocket()
-    socket.emit('leave_room', { roomCode, playerId })
+    socket.emit('leave_room', { roomCode, authToken })
+    clearPvpSession()
     navigate('/', { replace: true })
   }
 

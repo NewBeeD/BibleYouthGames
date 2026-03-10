@@ -1,4 +1,4 @@
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
@@ -17,6 +17,12 @@ const bibleServerDir = path.join(rootDir, 'apps', 'bibletimeline', 'server');
 const bibleFrontendBuild = path.join(rootDir, 'apps', 'bibletimeline', 'frontend', 'build');
 const npatDir = path.join(rootDir, 'apps', 'nameplaceanimalthing');
 const npatBuildDir = path.join(npatDir, '.next');
+const UPSTREAM_READY_TIMEOUT_MS = 30000;
+const UPSTREAM_RETRY_DELAY_MS = 500;
+
+let isShuttingDown = false;
+let shutdownPromise = null;
+let isGatewayReady = false;
 
 const runChild = (command, args, options) => {
   const child = spawn(command, args, {
@@ -29,13 +35,65 @@ const runChild = (command, args, options) => {
     }
   });
 
+  child.exitPromise = new Promise((resolve) => {
+    child.once('exit', (code, signal) => {
+      resolve({ code, signal });
+    });
+  });
+
   child.on('exit', (code) => {
     if (code !== 0) {
       console.error(`${options.name} exited with code ${code}`);
     }
+
+    if (!isShuttingDown) {
+      void shutdown(1);
+    }
   });
 
   return child;
+};
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const probeUpstream = (port, requestPath = '/health') => {
+  return new Promise((resolve) => {
+    const request = httpRequest(
+      {
+        hostname: '127.0.0.1',
+        port,
+        path: requestPath,
+        method: 'GET',
+        timeout: 2000,
+      },
+      (response) => {
+        response.resume();
+        resolve(response.statusCode >= 200 && response.statusCode < 300);
+      },
+    );
+
+    request.on('error', () => resolve(false));
+    request.on('timeout', () => {
+      request.destroy();
+      resolve(false);
+    });
+    request.end();
+  });
+};
+
+const waitForUpstream = async (name, port, requestPath = '/health') => {
+  const deadline = Date.now() + UPSTREAM_READY_TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    const isReady = await probeUpstream(port, requestPath);
+    if (isReady) {
+      return;
+    }
+
+    await wait(UPSTREAM_RETRY_DELAY_MS);
+  }
+
+  throw new Error(`${name} did not become ready in time`);
 };
 
 if (!existsSync(bibleFrontendBuild)) {
@@ -107,15 +165,6 @@ const launchPageHtml = `<!doctype html>
   </body>
 </html>`;
 
-const pickSocketTarget = (req) => {
-  const referer = String(req.headers.referer || '');
-  if (referer.includes('/bibletimeline')) {
-    return `http://127.0.0.1:${BIBLE_PORT}`;
-  }
-
-  return `http://127.0.0.1:${NPAT_PORT}`;
-};
-
 const rewritePath = (req, prefix) => {
   const original = req.url || '/';
   const next = original.replace(prefix, '') || '/';
@@ -126,8 +175,14 @@ const server = createServer((req, res) => {
   const requestPath = (req.url || '/').split('?')[0];
 
   if (requestPath === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true }));
+    res.writeHead(isGatewayReady ? 200 : 503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: isGatewayReady }));
+    return;
+  }
+
+  if (!isGatewayReady) {
+    res.writeHead(503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'Upstreams are still starting' }));
     return;
   }
 
@@ -165,11 +220,6 @@ const server = createServer((req, res) => {
     return;
   }
 
-  if (requestPath.startsWith('/socket.io')) {
-    proxy.web(req, res, { target: pickSocketTarget(req) });
-    return;
-  }
-
   res.writeHead(302, { Location: '/' });
   res.end();
 });
@@ -177,8 +227,8 @@ const server = createServer((req, res) => {
 server.on('upgrade', (req, socket, head) => {
   const requestPath = (req.url || '/').split('?')[0];
 
-  if (requestPath.startsWith('/socket.io')) {
-    proxy.ws(req, socket, head, { target: pickSocketTarget(req) });
+  if (!isGatewayReady) {
+    socket.destroy();
     return;
   }
 
@@ -208,17 +258,69 @@ server.on('upgrade', (req, socket, head) => {
   socket.destroy();
 });
 
-server.listen(PORT, () => {
-  console.log(`Church Games gateway listening on ${PORT}`);
-  console.log(`Bible Timeline proxied via /bibletimeline -> ${BIBLE_PORT}`);
-  console.log(`NamePlaceAnimalThing proxied via /nameplaceanimalthing -> ${NPAT_PORT}`);
-});
+const terminateChild = async (child, name) => {
+  if (!child || child.exitCode !== null || child.killed) {
+    return;
+  }
 
-const shutdown = () => {
-  bibleProcess.kill('SIGTERM');
-  npatProcess.kill('SIGTERM');
-  server.close(() => process.exit(0));
+  child.kill('SIGTERM');
+
+  const result = await Promise.race([
+    child.exitPromise,
+    wait(5000).then(() => null)
+  ]);
+
+  if (!result && child.exitCode === null) {
+    console.warn(`${name} did not exit after SIGTERM; forcing shutdown`);
+    child.kill('SIGKILL');
+    await child.exitPromise;
+  }
 };
 
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+const shutdown = async (exitCode = 0) => {
+  if (shutdownPromise) {
+    return shutdownPromise;
+  }
+
+  isShuttingDown = true;
+  isGatewayReady = false;
+
+  shutdownPromise = (async () => {
+    await Promise.allSettled([
+      terminateChild(bibleProcess, 'BibleTimeline server'),
+      terminateChild(npatProcess, 'NamePlaceAnimalThing server')
+    ]);
+
+    await new Promise((resolve) => {
+      server.close(() => resolve());
+    });
+
+    process.exit(exitCode);
+  })();
+
+  return shutdownPromise;
+};
+
+process.on('SIGINT', () => {
+  void shutdown(0);
+});
+process.on('SIGTERM', () => {
+  void shutdown(0);
+});
+
+try {
+  await Promise.all([
+    waitForUpstream('BibleTimeline server', BIBLE_PORT),
+    waitForUpstream('NamePlaceAnimalThing server', NPAT_PORT)
+  ]);
+
+  isGatewayReady = true;
+  server.listen(PORT, () => {
+    console.log(`Church Games gateway listening on ${PORT}`);
+    console.log(`Bible Timeline proxied via /bibletimeline -> ${BIBLE_PORT}`);
+    console.log(`NamePlaceAnimalThing proxied via /nameplaceanimalthing -> ${NPAT_PORT}`);
+  });
+} catch (error) {
+  console.error(String(error?.message || error));
+  await shutdown(1);
+}

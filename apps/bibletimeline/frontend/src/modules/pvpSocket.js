@@ -58,8 +58,8 @@ export const getPvpSocket = () => {
     autoConnect: true,
     timeout: 7000,
     reconnection: true,
-    reconnectionAttempts: 5,
-    reconnectionDelay: 600
+    reconnectionDelay: 600,
+    reconnectionDelayMax: 5000
   })
 
   return socketInstance

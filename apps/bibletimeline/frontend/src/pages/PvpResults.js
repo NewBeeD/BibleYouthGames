@@ -5,13 +5,16 @@ import { getPvpSocket } from '../modules/pvpSocket'
 import { auth } from '../firebaseAuth/firebaseSDK'
 import { upsertPvpCategoryStats } from '../modules/firebaseScores'
 import { PvpConnectionBadge } from '../components/PvpConnectionBadge'
+import { clearPvpSession, loadPvpSession } from '../modules/pvpSession'
 
 export const PvpResults = () => {
   const location = useLocation()
   const navigate = useNavigate()
 
-  const roomCode = location.state?.roomCode
-  const playerId = location.state?.playerId
+  const savedSession = loadPvpSession()
+  const roomCode = location.state?.roomCode || savedSession?.roomCode
+  const playerId = location.state?.playerId || savedSession?.playerId
+  const authToken = location.state?.authToken || savedSession?.authToken
 
   const [results, setResults] = useState(location.state?.roundResults || null)
   const [room, setRoom] = useState(null)
@@ -23,12 +26,16 @@ export const PvpResults = () => {
   const amHost = useMemo(() => room?.hostPlayerId === playerId, [room, playerId])
 
   useEffect(() => {
-    if(!roomCode || !playerId){
+    if(!roomCode || !playerId || !authToken){
       navigate('/pvp/join', { replace: true })
       return
     }
 
     const socket = getPvpSocket()
+
+    const syncRoomState = () => {
+      socket.emit('get_room_state', { roomCode, playerId, authToken })
+    }
 
     const handleRoundEnded = (payload) => {
       if(payload?.roomCode === roomCode){
@@ -38,7 +45,7 @@ export const PvpResults = () => {
 
     const handleRoundStarted = (payload) => {
       if(payload?.roomCode === roomCode){
-        navigate('/pvp/round', { state: { roomCode, playerId } })
+        navigate('/pvp/round', { state: { roomCode, playerId, authToken } })
       }
     }
 
@@ -56,6 +63,7 @@ export const PvpResults = () => {
 
     const handleRoomClosed = (payload) => {
       if(payload?.roomCode === roomCode){
+        clearPvpSession()
         navigate('/pvp/join', { replace: true })
       }
     }
@@ -72,8 +80,9 @@ export const PvpResults = () => {
     socket.on('room_state', handleRoomState)
     socket.on('room_closed', handleRoomClosed)
     socket.on('room_error', handleRoomError)
+    socket.on('connect', syncRoomState)
 
-    socket.emit('get_room_state', { roomCode })
+    syncRoomState()
 
     return () => {
       socket.off('round_ended', handleRoundEnded)
@@ -82,12 +91,13 @@ export const PvpResults = () => {
       socket.off('room_state', handleRoomState)
       socket.off('room_closed', handleRoomClosed)
       socket.off('room_error', handleRoomError)
+      socket.off('connect', syncRoomState)
     }
-  }, [navigate, roomCode, playerId])
+  }, [authToken, navigate, roomCode, playerId])
 
   const nextRound = () => {
     const socket = getPvpSocket()
-    socket.emit('next_round', { roomCode, playerId })
+    socket.emit('next_round', { roomCode, authToken })
   }
 
   const board = finalBoard?.leaderboard || results?.leaderboard || []
@@ -118,7 +128,8 @@ export const PvpResults = () => {
 
   const leaveGame = () => {
     const socket = getPvpSocket()
-    socket.emit('leave_room', { roomCode, playerId })
+    socket.emit('leave_room', { roomCode, authToken })
+    clearPvpSession()
     navigate('/', { replace: true })
   }
 

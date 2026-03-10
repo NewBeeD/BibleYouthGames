@@ -1,12 +1,14 @@
 "use client";
 
 import { create } from "zustand";
+import { createJSONStorage, persist } from "zustand/middleware";
 import type { GameRoomState } from "../types/game";
 
 type Session = {
   userId: string;
   username: string;
   code: string;
+  authToken: string;
 };
 
 type GameStore = {
@@ -19,12 +21,21 @@ type GameStore = {
   reset: () => void;
 };
 
-export const useGameStore = create<GameStore>((set) => ({
-  session: null,
-  game: null,
-  error: null,
-  setSession: (session) => set({ session }),
-  setGame: (game) => set({ game }),
-  setError: (error) => set({ error }),
-  reset: () => set({ session: null, game: null, error: null }),
-}));
+export const useGameStore = create<GameStore>()(
+  persist(
+    (set) => ({
+      session: null,
+      game: null,
+      error: null,
+      setSession: (session) => set({ session }),
+      setGame: (game) => set({ game }),
+      setError: (error) => set({ error }),
+      reset: () => set({ session: null, game: null, error: null }),
+    }),
+    {
+      name: "nameplaceanimalthing-session",
+      storage: createJSONStorage(() => localStorage),
+      partialize: (state) => ({ session: state.session }),
+    },
+  ),
+);

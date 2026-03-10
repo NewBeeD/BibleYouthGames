@@ -27,6 +27,11 @@ export const getSocket = async () => {
       socketInstance = io(wsUrl, {
         path: `${APP_BASE_PATH}/socket.io`,
         transports: ["websocket", "polling"],
+        autoConnect: true,
+        timeout: 20000,
+        reconnection: true,
+        reconnectionDelay: 800,
+        reconnectionDelayMax: 5000,
       });
 
       return socketInstance;

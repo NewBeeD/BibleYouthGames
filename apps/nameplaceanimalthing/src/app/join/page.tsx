@@ -46,7 +46,7 @@ export default function JoinPage() {
           userId,
           username: cleanName,
         },
-        (response: { ok: boolean; message?: string }) => {
+        (response: { ok: boolean; message?: string; authToken?: string }) => {
           if (!response?.ok) {
             const message = response?.message || "Room not found.";
             setFormError(message);
@@ -55,7 +55,7 @@ export default function JoinPage() {
             return;
           }
 
-          setSession({ userId, username: cleanName, code: cleanCode });
+          setSession({ userId, username: cleanName, code: cleanCode, authToken: response.authToken || "" });
           router.push(`/game/${cleanCode}`);
         },
       );

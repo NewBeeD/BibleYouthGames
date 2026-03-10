@@ -7,6 +7,7 @@ import { ensurePvpSocketConnected, emitPvpAck, getPvpServerUrl } from '../module
 import { GAME_TYPES, PVP_MODES } from '../modules/gameModes'
 import { PvpConnectionBadge } from '../components/PvpConnectionBadge'
 import { getPvpAnimalAvatars, loadPvpIdentity, savePvpIdentity } from '../modules/pvpIdentity'
+import { savePvpSession } from '../modules/pvpSession'
 
 export const PvpCreateMatch = () => {
   const location = useLocation()
@@ -82,11 +83,17 @@ export const PvpCreateMatch = () => {
         name: displayName,
         avatarIndex
       })
+      savePvpSession({
+        roomCode: response.roomCode,
+        playerId: response.playerId,
+        authToken: response.authToken
+      })
 
       navigate('/pvp/lobby', {
         state: {
           roomCode: response.roomCode,
           playerId: response.playerId,
+          authToken: response.authToken,
           host: true
         }
       })

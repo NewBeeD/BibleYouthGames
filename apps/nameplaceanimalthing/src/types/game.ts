@@ -4,6 +4,7 @@ export type GameUser = {
   id: string;
   username: string;
   isHost: boolean;
+  connected?: boolean;
 };
 
 export type GameSettings = {

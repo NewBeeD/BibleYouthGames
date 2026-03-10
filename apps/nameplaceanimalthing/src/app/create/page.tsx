@@ -88,14 +88,14 @@ export default function CreatePage() {
             context: context.trim(),
           },
         },
-        (response: { ok: boolean; message?: string }) => {
+        (response: { ok: boolean; message?: string; authToken?: string }) => {
           if (!response?.ok) {
             setFormError(response?.message || "Could not create game.");
             setSubmitting(false);
             return;
           }
 
-          setSession({ userId, username: cleanName, code });
+          setSession({ userId, username: cleanName, code, authToken: response.authToken || "" });
           router.push(`/game/${code}`);
         },
       );

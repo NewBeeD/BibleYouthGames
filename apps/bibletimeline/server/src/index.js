@@ -1,4 +1,5 @@
 import { createServer } from 'http'
+import { randomBytes } from 'crypto'
 import { existsSync, createReadStream } from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
@@ -24,6 +25,7 @@ const CLASSIC_MAX_TIME_BONUS_BY_DIFFICULTY = {
   5: 20,
   6: 25
 }
+const DISCONNECT_GRACE_MS = 90000
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const frontendBuildDir = path.resolve(__dirname, '../../frontend/build')
@@ -96,6 +98,55 @@ const io = new Server(server, {
 })
 
 const rooms = new Map()
+const presence = new Map()
+
+const createAuthToken = () => randomBytes(24).toString('hex')
+
+const removeDuplicatePresence = (roomCode, playerId, currentSocketId) => {
+  for(const [socketId, track] of presence.entries()){
+    if(socketId === currentSocketId){
+      continue
+    }
+
+    if(track?.roomCode === roomCode && track?.playerId === playerId){
+      presence.delete(socketId)
+      io.sockets.sockets.get(socketId)?.leave(roomCode)
+    }
+  }
+}
+
+const clearRoomCleanupTimeout = (room) => {
+  if(room?.cleanupTimeout){
+    clearTimeout(room.cleanupTimeout)
+    room.cleanupTimeout = null
+  }
+}
+
+const scheduleRoomCleanupIfEmpty = (room) => {
+  clearRoomCleanupTimeout(room)
+
+  if(room.players.some((player) => player.connected)){
+    return
+  }
+
+  room.cleanupTimeout = setTimeout(() => {
+    const liveRoom = rooms.get(room.code)
+    if(!liveRoom){
+      return
+    }
+
+    if(liveRoom.players.some((player) => player.connected)){
+      return
+    }
+
+    if(liveRoom.roundTimeout){
+      clearTimeout(liveRoom.roundTimeout)
+      liveRoom.roundTimeout = null
+    }
+
+    rooms.delete(liveRoom.code)
+  }, DISCONNECT_GRACE_MS)
+}
 
 const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1) + min)
 
@@ -249,6 +300,8 @@ const closeRoomForEveryone = (room, reason = 'Room closed') => {
     return
   }
 
+  clearRoomCleanupTimeout(room)
+
   if(room.roundTimeout){
     clearTimeout(room.roundTimeout)
     room.roundTimeout = null
@@ -259,7 +312,32 @@ const closeRoomForEveryone = (room, reason = 'Room closed') => {
     reason
   })
 
+  for(const [socketId, track] of presence.entries()){
+    if(track?.roomCode === room.code){
+      presence.delete(socketId)
+    }
+  }
+
   rooms.delete(room.code)
+}
+
+const getAuthorizedPlayer = (room, socket, payload) => {
+  const track = presence.get(socket.id)
+  if(!room || !track || track.roomCode !== room.code){
+    return null
+  }
+
+  const player = room.players.find((entry) => entry.playerId === track.playerId)
+  if(!player){
+    return null
+  }
+
+  const authToken = String(payload?.authToken || '').trim()
+  if(!authToken || player.authToken !== authToken){
+    return null
+  }
+
+  return player
 }
 
 const endRound = (room, reason) => {
@@ -302,6 +380,7 @@ const endRound = (room, reason) => {
       pvpMode: room.settings.pvpMode,
       leaderboard: getLeaderboard(room)
     }
+    room.lastMatchPayload = finalPayload
     io.to(room.code).emit('match_ended', finalPayload)
   }
 
@@ -319,6 +398,7 @@ const startRound = (room) => {
       pvpMode: room.settings.pvpMode,
       leaderboard: getLeaderboard(room)
     }
+    room.lastMatchPayload = finalPayload
     io.to(room.code).emit('match_ended', finalPayload)
     emitRoomState(room)
     return
@@ -418,6 +498,7 @@ io.on('connection', (socket) => {
         {
           playerId,
           socketId: socket.id,
+          authToken: createAuthToken(),
           name: hostName,
           avatar: payload?.host?.avatar || '',
           avatarEmoji: payload?.host?.avatarEmoji || '🕺🐶',
@@ -430,13 +511,17 @@ io.on('connection', (socket) => {
       roundIndex: 0,
       activeRound: null,
       roundTimeout: null,
-      lastRoundPayload: null
+      lastRoundPayload: null,
+      lastMatchPayload: null,
+      cleanupTimeout: null
     }
 
     rooms.set(roomCode, room)
+    removeDuplicatePresence(roomCode, playerId, socket.id)
+    presence.set(socket.id, { roomCode, playerId })
     socket.join(roomCode)
 
-    callback?.({ ok: true, roomCode, playerId })
+    callback?.({ ok: true, roomCode, playerId, authToken: room.players[0].authToken })
     emitRoomState(room)
   })
 
@@ -460,10 +545,12 @@ io.on('connection', (socket) => {
     }
 
     const playerId = `${Date.now()}-${Math.floor(Math.random() * 100000)}`
+    const authToken = createAuthToken()
 
     room.players.push({
       playerId,
       socketId: socket.id,
+      authToken,
       name: payload?.player?.name || 'Player',
       avatar: payload?.player?.avatar || '',
       avatarEmoji: payload?.player?.avatarEmoji || '🕺🐶',
@@ -473,9 +560,11 @@ io.on('connection', (socket) => {
       totalPoints: 0
     })
 
+    removeDuplicatePresence(roomCode, playerId, socket.id)
+    presence.set(socket.id, { roomCode, playerId })
     socket.join(roomCode)
 
-    callback?.({ ok: true, roomCode, playerId })
+    callback?.({ ok: true, roomCode, playerId, authToken })
     emitRoomState(room)
   })
 
@@ -483,9 +572,29 @@ io.on('connection', (socket) => {
     const roomCode = String(payload?.roomCode || '').trim()
     const room = rooms.get(roomCode)
     if(room){
+      const playerId = String(payload?.playerId || '').trim()
+      const authToken = String(payload?.authToken || '').trim()
+      if(playerId){
+        const player = room.players.find((item) => item.playerId === playerId)
+        if(player && player.authToken === authToken){
+          clearRoomCleanupTimeout(room)
+          removeDuplicatePresence(roomCode, playerId, socket.id)
+          presence.set(socket.id, { roomCode, playerId })
+          player.socketId = socket.id
+          player.connected = true
+          socket.join(roomCode)
+        } else {
+          socket.emit('room_error', { roomCode, error: 'Session expired. Rejoin the room.' })
+          return
+        }
+      }
+
       emitRoomState(room)
       if(room.lastRoundPayload && room.status === 'round_results'){
         socket.emit('round_ended', room.lastRoundPayload)
+      }
+      if(room.lastMatchPayload && room.status === 'finished'){
+        socket.emit('match_ended', room.lastMatchPayload)
       }
     }
   })
@@ -496,7 +605,7 @@ io.on('connection', (socket) => {
       return
     }
 
-    const player = room.players.find((item) => item.playerId === payload?.playerId)
+    const player = getAuthorizedPlayer(room, socket, payload)
     if(!player){
       return
     }
@@ -511,7 +620,8 @@ io.on('connection', (socket) => {
       return
     }
 
-    if(room.hostPlayerId !== payload?.playerId){
+    const player = getAuthorizedPlayer(room, socket, payload)
+    if(!player || room.hostPlayerId !== player.playerId){
       socket.emit('room_error', { roomCode: room.code, error: 'Only host can start the match' })
       return
     }
@@ -540,7 +650,7 @@ io.on('connection', (socket) => {
       return
     }
 
-    const player = room.players.find((item) => item.playerId === payload?.playerId)
+    const player = getAuthorizedPlayer(room, socket, payload)
     if(!player){
       return
     }
@@ -608,7 +718,7 @@ io.on('connection', (socket) => {
       return
     }
 
-    const player = room.players.find((item) => item.playerId === payload?.playerId)
+    const player = getAuthorizedPlayer(room, socket, payload)
     if(!player){
       return
     }
@@ -711,7 +821,8 @@ io.on('connection', (socket) => {
       return
     }
 
-    if(room.hostPlayerId !== payload?.playerId){
+    const player = getAuthorizedPlayer(room, socket, payload)
+    if(!player || room.hostPlayerId !== player.playerId){
       socket.emit('room_error', { roomCode: room.code, error: 'Only host can continue' })
       return
     }
@@ -727,10 +838,14 @@ io.on('connection', (socket) => {
       return
     }
 
-    const playerId = payload?.playerId
-    if(!playerId){
+    const player = getAuthorizedPlayer(room, socket, payload)
+    if(!player){
       return
     }
+
+    const playerId = player.playerId
+
+    presence.delete(socket.id)
 
     if(room.hostPlayerId === playerId){
       closeRoomForEveryone(room, 'Host left the game')
@@ -749,37 +864,37 @@ io.on('connection', (socket) => {
   })
 
   socket.on('disconnect', () => {
-    rooms.forEach((room, roomCode) => {
-      const disconnectedPlayer = room.players.find((player) => player.socketId === socket.id)
-      if(!disconnectedPlayer){
-        return
-      }
+    const track = presence.get(socket.id)
+    presence.delete(socket.id)
 
-      if(disconnectedPlayer.playerId === room.hostPlayerId){
-        closeRoomForEveryone(room, 'Host disconnected')
-        return
-      }
+    if(!track){
+      return
+    }
 
-      let changed = false
+    const room = rooms.get(track.roomCode)
+    if(!room){
+      return
+    }
 
-      room.players.forEach((player) => {
-        if(player.socketId === socket.id){
-          player.connected = false
-          changed = true
-        }
-      })
+    const disconnectedPlayer = room.players.find((player) => player.playerId === track.playerId)
+    if(!disconnectedPlayer){
+      return
+    }
 
-      if(changed){
-        emitRoomState(room)
-      }
+    let changed = false
 
-      if(room.players.every((player) => !player.connected)){
-        if(room.roundTimeout){
-          clearTimeout(room.roundTimeout)
-        }
-        rooms.delete(roomCode)
+    room.players.forEach((player) => {
+      if(player.playerId === disconnectedPlayer.playerId){
+        player.connected = false
+        changed = true
       }
     })
+
+    if(changed){
+      emitRoomState(room)
+    }
+
+    scheduleRoomCleanupIfEmpty(room)
   })
 })
 

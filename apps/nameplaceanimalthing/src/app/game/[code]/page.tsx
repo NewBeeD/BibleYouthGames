@@ -128,6 +128,25 @@ export default function GamePage() {
           }, 900);
         };
 
+        const joinRoom = () => {
+          socket.emit("join-room", {
+            code: session.code,
+            userId: session.userId,
+            username: session.username,
+            authToken: session.authToken,
+          }, (response: { ok: boolean; message?: string }) => {
+            if (!mounted || response?.ok) {
+              return;
+            }
+
+            setStatus(response?.message || "Could not rejoin room.");
+            setTimeout(() => {
+              reset();
+              router.replace("/join");
+            }, 900);
+          });
+        };
+
         socket.on("room-state", handleRoomState);
         socket.on("round-start", handleRoundStart);
         socket.on("submit-error", handleSubmitError);
@@ -136,12 +155,9 @@ export default function GamePage() {
         socket.on("scores-submitted", handleScoresSubmitted);
         socket.on("game-end", handleGameEnd);
         socket.on("room-closed", handleRoomClosed);
+        socket.on("connect", joinRoom);
 
-        socket.emit("join-room", {
-          code: session.code,
-          userId: session.userId,
-          username: session.username,
-        });
+        joinRoom();
 
         return () => {
           socket.off("room-state", handleRoomState);
@@ -152,6 +168,7 @@ export default function GamePage() {
           socket.off("scores-submitted", handleScoresSubmitted);
           socket.off("game-end", handleGameEnd);
           socket.off("room-closed", handleRoomClosed);
+          socket.off("connect", joinRoom);
         };
       } catch {
         setError("Socket connection failed.");
@@ -175,7 +192,7 @@ export default function GamePage() {
     socketPromise.then((socket) => {
       socket.emit("draft-response", {
         code: game.code,
-        userId: session.userId,
+        authToken: session.authToken,
         answers,
       });
     });
@@ -195,26 +212,38 @@ export default function GamePage() {
   }, [game]);
 
   useEffect(() => {
-    if (!game || !session || game.phase !== "scoring") {
+    if (!game || !session) {
+      return;
+    }
+
+    if (game.phase !== "scoring") {
+      setScoreSheet({});
       return;
     }
 
     const assignedTargets = game.scoringAssignments?.[session.userId] || [];
-    const initial: Record<string, Record<string, number>> = {};
-    for (const targetId of assignedTargets) {
-      initial[targetId] = {};
-      for (const category of game.settings.categories) {
-        const isLockedDuplicate = Boolean(game.manualScoreLocks?.[targetId]?.[category]);
-        initial[targetId][category] = isLockedDuplicate ? 5 : 0;
-      }
-    }
+    setScoreSheet((previous) => {
+      const next: Record<string, Record<string, number>> = {};
 
-    setScoreSheet(initial);
+      for (const targetId of assignedTargets) {
+        next[targetId] = {};
+        for (const category of game.settings.categories) {
+          const isLockedDuplicate = Boolean(game.manualScoreLocks?.[targetId]?.[category]);
+          next[targetId][category] = isLockedDuplicate ? 5 : (previous[targetId]?.[category] ?? 0);
+        }
+      }
+
+      return next;
+    });
   }, [game, session]);
 
   const startGame = async () => {
+    if (!session) {
+      return;
+    }
+
     const socket = await getSocket();
-    socket.emit("start-game", { code: roomCode });
+    socket.emit("start-game", { code: roomCode, authToken: session.authToken });
   };
 
   const submitResponse = async () => {
@@ -237,19 +266,20 @@ export default function GamePage() {
     const socket = await getSocket();
     socket.emit("submit-response", {
       code: game.code,
-      userId: session.userId,
+      authToken: session.authToken,
       answers,
     });
   };
 
   const goNextStage = async () => {
-    if (!game) {
+    if (!game || !session) {
       return;
     }
 
     const socket = await getSocket();
     socket.emit("next-stage", {
       code: game.code,
+      authToken: session.authToken,
     });
   };
 
@@ -261,7 +291,7 @@ export default function GamePage() {
     const socket = await getSocket();
     socket.emit("submit-scores", {
       code: game.code,
-      userId: session.userId,
+      authToken: session.authToken,
       scores: scoreSheet,
     });
   };
@@ -304,6 +334,7 @@ export default function GamePage() {
             {
               code: session.code,
               userId: session.userId,
+              authToken: session.authToken,
             },
             () => resolve(),
           );

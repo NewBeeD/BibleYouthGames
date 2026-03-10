@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { randomBytes } from "node:crypto";
 import { createServer } from "node:http";
 import next from "next";
 import { Server as SocketIOServer } from "socket.io";
@@ -10,6 +11,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1";
 const OPENAI_MAX_CONCURRENT_REQUESTS = Math.max(1, Number(process.env.OPENAI_MAX_CONCURRENT_REQUESTS || 2));
 const ROUND_DURATION_MS = 60_000;
+const DISCONNECT_GRACE_MS = 90_000;
 
 let activeOpenAIRequests = 0;
 const openAIQueue = [];
@@ -208,6 +210,8 @@ const normalizeManualScore = (value) => {
   }
   return numeric >= 5 ? 5 : 0;
 };
+
+const createAuthToken = () => randomBytes(24).toString("hex");
 
 const getAlphabeticLength = (value) => {
   const cleaned = String(value || "").trim();
@@ -674,6 +678,12 @@ const handle = app.getRequestHandler();
 
 app.prepare().then(() => {
   const httpServer = createServer((req, res) => {
+    if (req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
     handle(req, res);
   });
 
@@ -686,6 +696,48 @@ app.prepare().then(() => {
   const rooms = new Map();
   const presence = new Map();
   const roundTimeouts = new Map();
+
+  const clearRoomCleanup = (room) => {
+    if (room?.cleanupTimeout) {
+      clearTimeout(room.cleanupTimeout);
+      room.cleanupTimeout = null;
+    }
+  };
+
+  const scheduleRoomCleanupIfEmpty = (room) => {
+    clearRoomCleanup(room);
+
+    if (room.users.some((user) => user.connected !== false)) {
+      return;
+    }
+
+    room.cleanupTimeout = setTimeout(() => {
+      const liveRoom = rooms.get(room.code);
+      if (!liveRoom) {
+        return;
+      }
+
+      if (liveRoom.users.some((user) => user.connected !== false)) {
+        return;
+      }
+
+      clearRoundTimeout(liveRoom.code);
+      rooms.delete(liveRoom.code);
+    }, DISCONNECT_GRACE_MS);
+  };
+
+  const removeDuplicatePresence = (code, userId, currentSocketId) => {
+    for (const [socketId, track] of presence.entries()) {
+      if (socketId === currentSocketId) {
+        continue;
+      }
+
+      if (track?.code === code && track?.userId === userId) {
+        presence.delete(socketId);
+        io.sockets.sockets.get(socketId)?.leave(code);
+      }
+    }
+  };
 
   const clearRoundTimeout = (roomCode) => {
     const timeout = roundTimeouts.get(roomCode);
@@ -793,6 +845,8 @@ app.prepare().then(() => {
   };
 
   const closeRoomForAll = (roomCode, reason = "Host left. Room closed.") => {
+    const room = rooms.get(roomCode);
+    clearRoomCleanup(room);
     clearRoundTimeout(roomCode);
     io.to(roomCode).emit("room-closed", { reason });
     io.in(roomCode).socketsLeave(roomCode);
@@ -806,21 +860,80 @@ app.prepare().then(() => {
     rooms.delete(roomCode);
   };
 
+  const sanitizeUser = (user) => ({
+    id: user.id,
+    username: user.username,
+    isHost: Boolean(user.isHost),
+    connected: user.connected !== false,
+  });
+
+  const buildVisibleAnswers = (room, viewerId) => {
+    if (!viewerId) {
+      return {};
+    }
+
+    if (room.phase === "play") {
+      return room.currentAnswers[viewerId] ? { [viewerId]: room.currentAnswers[viewerId] } : {};
+    }
+
+    if (room.phase === "scoring") {
+      const visibleUserIds = new Set([viewerId, ...(room.scoringAssignments?.[viewerId] || [])]);
+      return Object.fromEntries(
+        [...visibleUserIds]
+          .filter((userId) => Boolean(room.currentAnswers[userId]))
+          .map((userId) => [userId, room.currentAnswers[userId]]),
+      );
+    }
+
+    return {};
+  };
+
+  const buildVisibleScoringAssignments = (room, viewerId) => {
+    if (room.phase !== "scoring" || !viewerId) {
+      return {};
+    }
+
+    return {
+      [viewerId]: room.scoringAssignments?.[viewerId] || [],
+    };
+  };
+
+  const buildVisibleManualScoreLocks = (room, viewerId) => {
+    if (room.phase !== "scoring" || !viewerId) {
+      return {};
+    }
+
+    const targetIds = room.scoringAssignments?.[viewerId] || [];
+    return Object.fromEntries(targetIds.map((targetId) => [targetId, room.manualScoreLocks?.[targetId] || {}]));
+  };
+
+  const buildRoomStateForUser = (room, viewerId) => ({
+    code: room.code,
+    users: room.users.map(sanitizeUser),
+    settings: room.settings,
+    currentRound: room.currentRound,
+    currentLetter: room.currentLetter,
+    phase: room.phase,
+    roundEndsAt: room.roundEndsAt,
+    currentAnswers: buildVisibleAnswers(room, viewerId),
+    totalScores: room.totalScores,
+    roundBreakdown: room.roundBreakdown,
+    scoringAssignments: buildVisibleScoringAssignments(room, viewerId),
+    manualScoreLocks: buildVisibleManualScoreLocks(room, viewerId),
+  });
+
+  const emitUserList = (room, eventName) => {
+    io.to(room.code).emit(eventName, room.users.map(sanitizeUser));
+  };
+
   const emitRoomState = (room) => {
-    io.to(room.code).emit("room-state", {
-      code: room.code,
-      users: room.users,
-      settings: room.settings,
-      currentRound: room.currentRound,
-      currentLetter: room.currentLetter,
-      phase: room.phase,
-      roundEndsAt: room.roundEndsAt,
-      currentAnswers: room.currentAnswers,
-      totalScores: room.totalScores,
-      roundBreakdown: room.roundBreakdown,
-      scoringAssignments: room.scoringAssignments,
-      manualScoreLocks: room.manualScoreLocks,
-    });
+    for (const [socketId, track] of presence.entries()) {
+      if (track?.code !== room.code) {
+        continue;
+      }
+
+      io.to(socketId).emit("room-state", buildRoomStateForUser(room, track.userId));
+    }
   };
 
   const getRoomBySocket = (socket) => {
@@ -832,11 +945,31 @@ app.prepare().then(() => {
     return rooms.get(track.code) || null;
   };
 
+  const getAuthorizedUser = (room, socket, payload) => {
+    const track = presence.get(socket.id);
+    if (!room || !track || track.code !== room.code) {
+      return null;
+    }
+
+    const user = room.users.find((entry) => entry.id === track.userId);
+    if (!user) {
+      return null;
+    }
+
+    const authToken = String(payload?.authToken || "").trim();
+    if (!authToken || user.authToken !== authToken) {
+      return null;
+    }
+
+    return user;
+  };
+
   io.on("connection", (socket) => {
     socket.on("join-room", (payload, callback) => {
       const code = String(payload?.code || "").trim();
       const userId = String(payload?.userId || "").trim();
       const username = String(payload?.username || "").trim();
+      const providedAuthToken = String(payload?.authToken || "").trim();
 
       if (!code || !userId || !username) {
         callback?.({ ok: false, message: "Invalid room payload." });
@@ -853,7 +986,7 @@ app.prepare().then(() => {
 
         room = {
           code,
-          users: [{ id: userId, username, isHost: true }],
+          users: [{ id: userId, username, isHost: true, connected: true, authToken: createAuthToken() }],
           settings: normalizeSettings(payload.settings),
           currentRound: 0,
           currentLetter: "",
@@ -868,6 +1001,7 @@ app.prepare().then(() => {
           roundEndsAt: 0,
           roundFinalized: false,
           roundFinalizedBy: null,
+          cleanupTimeout: null,
         };
 
         rooms.set(code, room);
@@ -880,19 +1014,29 @@ app.prepare().then(() => {
         }
 
         if (existing) {
+          if (!providedAuthToken || existing.authToken !== providedAuthToken) {
+            callback?.({ ok: false, message: "Session expired. Rejoin from the lobby." });
+            return;
+          }
+
           existing.username = username;
+          existing.connected = true;
         } else {
-          room.users.push({ id: userId, username, isHost: false });
+          room.users.push({ id: userId, username, isHost: false, connected: true, authToken: createAuthToken() });
           room.totalScores[userId] = room.totalScores[userId] || 0;
         }
       }
 
+      const activeUser = room.users.find((user) => user.id === userId);
+
+      clearRoomCleanup(room);
+      removeDuplicatePresence(code, userId, socket.id);
       presence.set(socket.id, { code, userId });
       socket.join(code);
 
-      io.to(code).emit("user-joined", room.users);
+      emitUserList(room, "user-joined");
       emitRoomState(room);
-      callback?.({ ok: true });
+      callback?.({ ok: true, authToken: activeUser?.authToken || "" });
     });
 
     socket.on("start-game", (payload) => {
@@ -906,8 +1050,7 @@ app.prepare().then(() => {
         return;
       }
 
-      const requesterId = presence.get(socket.id)?.userId;
-      const requester = room.users.find((user) => user.id === requesterId);
+      const requester = getAuthorizedUser(room, socket, payload);
 
       if (!requester?.isHost) {
         return;
@@ -942,13 +1085,13 @@ app.prepare().then(() => {
         return;
       }
 
-      const userId = String(payload?.userId || "").trim();
-      if (!userId) {
+      const requester = getAuthorizedUser(room, socket, payload);
+      if (!requester) {
         return;
       }
 
       const partial = payload?.answers || {};
-      const previous = room.currentAnswers[userId] || {};
+      const previous = room.currentAnswers[requester.id] || {};
       const merged = { ...previous };
 
       for (const category of room.settings.categories) {
@@ -958,7 +1101,7 @@ app.prepare().then(() => {
         }
       }
 
-      room.currentAnswers[userId] = merged;
+      room.currentAnswers[requester.id] = merged;
     });
 
     socket.on("submit-response", (payload) => {
@@ -967,19 +1110,19 @@ app.prepare().then(() => {
         return;
       }
 
-      const userId = String(payload?.userId || "").trim();
-      if (!userId) {
+      const requester = getAuthorizedUser(room, socket, payload);
+      if (!requester) {
         return;
       }
 
-      if (room.submittedUserIds.includes(userId)) {
+      if (room.submittedUserIds.includes(requester.id)) {
         return;
       }
 
       const submitted = payload.answers || {};
       const finalAnswers = {};
       for (const category of room.settings.categories) {
-        finalAnswers[category] = String(submitted[category] || room.currentAnswers[userId]?.[category] || "").trim();
+        finalAnswers[category] = String(submitted[category] || room.currentAnswers[requester.id]?.[category] || "").trim();
       }
 
       const hasAllFields = room.settings.categories.every((category) => Boolean(finalAnswers[category]));
@@ -988,10 +1131,10 @@ app.prepare().then(() => {
         return;
       }
 
-      room.currentAnswers[userId] = finalAnswers;
-      room.submittedUserIds.push(userId);
+      room.currentAnswers[requester.id] = finalAnswers;
+      room.submittedUserIds.push(requester.id);
 
-      finalizeRoundToGrading(room, userId, "submit");
+      finalizeRoundToGrading(room, requester.id, "submit");
     });
 
     socket.on("submit-scores", (payload, callback) => {
@@ -1001,12 +1144,13 @@ app.prepare().then(() => {
         return;
       }
 
-      const scorerId = String(payload?.userId || "").trim();
-      if (!scorerId) {
+      const scorer = getAuthorizedUser(room, socket, payload);
+      if (!scorer) {
         callback?.({ ok: false, message: "Invalid scorer." });
         return;
       }
 
+      const scorerId = scorer.id;
       const assignedTargets = room.scoringAssignments?.[scorerId] || [];
       const submittedScores = payload?.scores || {};
       const sanitizedScores = {};
@@ -1092,8 +1236,7 @@ app.prepare().then(() => {
         return;
       }
 
-      const requesterId = presence.get(socket.id)?.userId;
-      const requester = room.users.find((user) => user.id === requesterId);
+      const requester = getAuthorizedUser(room, socket, payload);
       if (!requester?.isHost) {
         callback?.({ ok: false, message: "Only host can continue." });
         return;
@@ -1149,6 +1292,7 @@ app.prepare().then(() => {
       const track = presence.get(socket.id);
       const code = String(payload?.code || "").trim();
       const userId = String(payload?.userId || "").trim();
+      const authToken = String(payload?.authToken || "").trim();
 
       if (!track || !code || !userId || track.code !== code || track.userId !== userId) {
         callback?.({ ok: false, message: "Leave request is invalid." });
@@ -1165,11 +1309,18 @@ app.prepare().then(() => {
       }
 
       const leavingUser = room.users.find((user) => user.id === userId);
+      if (!leavingUser || leavingUser.authToken !== authToken) {
+        callback?.({ ok: false, message: "Leave request is invalid." });
+        return;
+      }
+
       if (leavingUser?.isHost) {
         closeRoomForAll(code, "Host exited. Room closed.");
         callback?.({ ok: true });
         return;
       }
+
+      clearRoomCleanup(room);
 
       room.users = room.users.filter((user) => user.id !== userId);
       delete room.totalScores[userId];
@@ -1195,7 +1346,7 @@ app.prepare().then(() => {
         room.scoreSheets = {};
       }
 
-      io.to(code).emit("user-left", room.users);
+      emitUserList(room, "user-left");
       emitRoomState(room);
       callback?.({ ok: true });
     });
@@ -1214,30 +1365,13 @@ app.prepare().then(() => {
       }
 
       const leavingUser = room.users.find((user) => user.id === track.userId);
-      if (leavingUser?.isHost) {
-        closeRoomForAll(track.code, "Host disconnected. Room closed.");
+      if (!leavingUser) {
         return;
       }
 
-      room.users = room.users.filter((user) => user.id !== track.userId);
-
-      if (room.users.length === 0) {
-        clearRoundTimeout(track.code);
-        rooms.delete(track.code);
-        return;
-      }
-
-      if (!room.users.some((user) => user.isHost)) {
-        room.users[0].isHost = true;
-      }
-
-      if (room.phase === "scoring") {
-        room.scoringAssignments = generateManualScoringAssignments(room.users);
-        room.manualScoreLocks = buildManualDuplicateLocks(room);
-        room.scoreSheets = {};
-      }
-
-      io.to(room.code).emit("user-left", room.users);
+      leavingUser.connected = false;
+      scheduleRoomCleanupIfEmpty(room);
+      emitUserList(room, "user-left");
       emitRoomState(room);
     });
   });
